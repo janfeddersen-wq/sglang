@@ -310,6 +310,86 @@ class DFlashVerifyInput(SpecInput):
                 self.custom_mask = mask
         return kv_indices, cum_kv_seq_len, qo_indptr, mask
 
+    def _apply_grammar_vocab_mask(
+        self,
+        batch: ScheduleBatch,
+        candidates: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
+    ) -> None:
+        """Mask the verify block's target logits for grammar-constrained requests.
+
+        DFLASH verifies a linear block ``[c0, c1, ..., c_{T-1}]`` in one target
+        forward; ``logits[pos]`` predicts the token following ``c_pos``. A grammar
+        FSM is sequential (the legal set at ``pos`` depends on tokens ``c1..c_pos``),
+        so we build the bitmask along the DRAFT path -- exactly as EAGLE's
+        ``generate_token_bitmask`` does over its tree, adapted here to a chain:
+
+          * fill the mask for position 0 from the request's current FSM state;
+          * for pos = 1..T-1, if the drafted token ``c_pos`` is grammar-legal under
+            position ``pos-1``'s mask, advance the FSM through it and fill position
+            ``pos``; stop at the first grammar-illegal draft token (its mask at
+            ``pos-1`` already forbids it, forcing rejection + a legal bonus there).
+
+        Rows left unfilled (non-grammar requests, or positions past a violation /
+        termination) keep ``allocate``'s all-allowed default, so mixed batches and
+        the non-grammar fast path are unaffected. The FSM is rolled back here; the
+        real commit-time advance happens in ``verify`` via ``grammar.accept_token``.
+        """
+        logits = logits_output.next_token_logits
+        vocab_size = int(logits.shape[-1])
+        T = int(self.draft_token_num)
+
+        grammar_ref = next(
+            (req.grammar for req in batch.reqs if req.grammar is not None), None
+        )
+        if grammar_ref is None:
+            return
+
+        # CPU int32 bitmask [bs*T, ceil(vocab/32)], default = all tokens allowed.
+        bitmask = grammar_ref.allocate_vocab_mask(
+            vocab_size=vocab_size,
+            batch_size=len(batch.reqs) * T,
+            device="cpu",
+        )
+        candidates_cpu = candidates.to("cpu")
+        filled = False
+
+        for i, req in enumerate(batch.reqs):
+            g = req.grammar
+            if g is None:
+                continue
+            base = i * T
+            advanced = 0
+            try:
+                # Position 0: c0 is the current token (already committed last step,
+                # FSM already advanced through it). Mask predicts c1.
+                g.fill_vocab_mask(bitmask, base)
+                filled = True
+                if g.is_terminated():
+                    continue
+                for pos in range(1, T):
+                    tok = int(candidates_cpu[i, pos].item())
+                    parent = bitmask[base + pos - 1]
+                    # Bit set in the parent mask == token allowed by the grammar.
+                    if tok >= vocab_size or (
+                        int(parent[tok // 32].item()) & (1 << (tok % 32))
+                    ) == 0:
+                        break  # draft diverges from grammar; rest stays all-allowed
+                    g.accept_token(tok)
+                    advanced += 1
+                    if g.is_terminated():
+                        break
+                    g.fill_vocab_mask(bitmask, base + pos)
+            finally:
+                if advanced:
+                    g.rollback(advanced)
+
+        if not filled:
+            return
+
+        vocab_mask = grammar_ref.move_vocab_mask(bitmask, logits.device)
+        grammar_ref.apply_vocab_mask(logits=logits, vocab_mask=vocab_mask)
+
     def verify(
         self,
         *,
@@ -363,6 +443,15 @@ class DFlashVerifyInput(SpecInput):
                 )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
+
+        # Grammar-constrained decoding (structured output / JSON schema): mask each
+        # block position's target logits to the grammar-legal token set BEFORE
+        # verification, so both the accepted drafts and the bonus token are valid.
+        # Applied after penalties/bias (matches EAGLE ordering). No-op + zero overhead
+        # when no request in the batch carries a grammar.
+        if any(req.grammar is not None for req in batch.reqs):
+            self._apply_grammar_vocab_mask(batch, candidates, logits_output)
+
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy

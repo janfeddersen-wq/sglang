@@ -643,15 +643,7 @@ def validate_dflash_request(req: Req) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
 
-    if (
-        req.sampling_params.json_schema is not None
-        or req.sampling_params.regex is not None
-        or req.sampling_params.ebnf is not None
-        or req.sampling_params.structural_tag is not None
-    ):
-        return (
-            "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
-        )
-
+    # Grammar-constrained decoding (json_schema / regex / ebnf / structural_tag) IS
+    # supported: DFlashVerifyInput.verify() masks each block position's target logits
+    # along the draft path (see _apply_grammar_vocab_mask). No request-level rejection.
     return None
